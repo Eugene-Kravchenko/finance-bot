@@ -1,10 +1,10 @@
+import functools
 import logging
 import os
-import sqlite3
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -19,63 +19,69 @@ from telegram.ext import (
     filters,
 )
 
+import access
+import config
+import dashboard
+import stats
+import storage
+from storage import db
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+# httpx на уровне INFO пишет в лог полный URL запроса к Telegram, а в нём — токен бота.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class RedactSecrets(logging.Filter):
+    """Страховка: вырезает токен из любой строки лога."""
+
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self.secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.secret:
+            message = record.getMessage()
+            if self.secret in message:
+                record.msg = message.replace(self.secret, "***")
+                record.args = None
+        return True
+
+
 LOG = logging.getLogger(__name__)
 
-TZ_NAME = os.getenv("TZ", "Europe/Moscow")
-TZ = ZoneInfo(TZ_NAME)
-DB_PATH = Path(os.getenv("DB_PATH", "data/mood.sqlite3"))
-CHECKIN_TIMES = [
-    item.strip() for item in os.getenv("CHECKIN_TIMES", "10:00,16:00,22:00").split(",")
-    if item.strip()
-]
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+TZ_NAME = config.TZ_NAME
+TZ = config.TZ
+CHECKIN_TIMES = config.CHECKIN_TIMES
 
 CONSENT, MOOD, ENERGY, ANXIETY, SLEEP, MEDS, SIDE_EFFECTS, NOTE, SAFETY = range(9)
 
 
-def db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS participants (
-                chat_id INTEGER PRIMARY KEY,
-                first_name TEXT,
-                username TEXT,
-                consented_at TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
-            );
+    storage.migrate()
 
-            CREATE TABLE IF NOT EXISTS checkins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                started_at TEXT NOT NULL,
-                completed_at TEXT NOT NULL,
-                period TEXT NOT NULL,
-                mood INTEGER NOT NULL,
-                energy INTEGER NOT NULL,
-                anxiety INTEGER NOT NULL,
-                sleep_hours REAL,
-                meds TEXT NOT NULL,
-                side_effects TEXT,
-                note TEXT,
-                safety TEXT,
-                FOREIGN KEY(chat_id) REFERENCES participants(chat_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_checkins_chat_time
-            ON checkins(chat_id, completed_at);
-            """
-        )
+
+def timed(handler):
+    """Пишет в лог длительность обработки (без содержимого сообщений)."""
+    @functools.wraps(handler)
+    async def wrapper(update, context):
+        started = time.perf_counter()
+        message = getattr(update, "message", None)
+        if message is not None and message.date:
+            # Задержка доставки: от отправки сообщения до начала обработки ботом.
+            lag = (datetime.now(message.date.tzinfo) - message.date).total_seconds()
+            if lag > 5:
+                LOG.warning("handler=%s delivery_lag=%.0fs", handler.__name__, lag)
+        try:
+            return await handler(update, context)
+        finally:
+            ms = (time.perf_counter() - started) * 1000
+            level = logging.WARNING if ms > 2000 else logging.INFO
+            LOG.log(level, "handler=%s took=%.0fms", handler.__name__, ms)
+    return wrapper
 
 
 def scale_keyboard(prefix: str, minimum: int = 1, maximum: int = 10) -> InlineKeyboardMarkup:
@@ -120,7 +126,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "Бот уже подключён. Я буду ненавязчиво спрашивать о состоянии "
             f"в {', '.join(CHECKIN_TIMES)} ({TZ_NAME}).\n\n"
-            "Команды: /checkin, /report, /export, /pause, /resume, /delete_my_data"
+            "Команды: /checkin, /pult, /report, /export, /pause, /resume, /delete_my_data",
+            reply_markup=dashboard.menu_keyboard("owner"),
         )
         return ConversationHandler.END
 
@@ -130,8 +137,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]])
     await update.message.reply_text(
         "Этот бот помогает отмечать настроение и самочувствие. Ответы сохраняются "
-        "в закрытой базе и могут быть выгружены в Excel. Если задан администратор, "
-        "он также сможет получить сводку. Это не медицинская диагностика и не замена врачу.\n\n"
+        "в закрытой базе и могут быть выгружены в Excel или PDF. Записи видишь только ты. "
+        "Если захочешь, сможешь сама дать доступ одному человеку и отключить его в любой момент. "
+        "Это не медицинская диагностика и не замена врачу.\n\n"
         "Ты согласна на хранение этих данных?",
         reply_markup=keyboard,
     )
@@ -202,8 +210,12 @@ async def scheduled_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Короткая отметка самочувствия — около минуты.",
                 reply_markup=keyboard,
             )
+            status = "prompt_sent"
         except Exception:
             LOG.exception("Не удалось отправить напоминание chat_id=%s", row["chat_id"])
+            status = "prompt_failed"
+        with db() as conn:
+            storage.log_event(conn, row["chat_id"], status, datetime.now(TZ).isoformat())
 
 
 async def begin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -372,61 +384,28 @@ async def finish_checkin(
         )
     target = message or update.message
     assert target
-    await target.reply_text("Готово. Спасибо — отметка сохранена.")
+    await target.reply_text(
+        "Готово. Спасибо — отметка сохранена.",
+        reply_markup=dashboard.after_checkin_keyboard(),
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
 
 def report_text(chat_id: int, days: int = 7) -> str:
-    since = (datetime.now(TZ) - timedelta(days=days)).isoformat()
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT mood, energy, anxiety, sleep_hours, meds
-               FROM checkins WHERE chat_id = ? AND completed_at >= ?
-               ORDER BY completed_at""",
-            (chat_id, since),
-        ).fetchall()
-    if not rows:
-        return "За последние 7 дней отметок пока нет."
-
-    def avg(field: str) -> str:
-        values = [float(row[field]) for row in rows if row[field] is not None]
-        return f"{sum(values) / len(values):.1f}" if values else "—"
-
-    meds_ok = sum(row["meds"] == "yes" for row in rows)
-    return (
-        f"Сводка за 7 дней ({len(rows)} отметок):\n"
-        f"• настроение: {avg('mood')}/10\n"
-        f"• энергия: {avg('energy')}/10\n"
-        f"• тревога: {avg('anxiety')}/10\n"
-        f"• сон: {avg('sleep_hours')} ч\n"
-        f"• лекарства по назначению: {meds_ok} из {len(rows)} отметок\n\n"
-        "Это наблюдение за динамикой, а не медицинское заключение."
-    )
+    return dashboard.period_text(stats.last_days(chat_id, days), f"Сводка за {days} дней")
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_chat and update.message
-    target = report_target(update.effective_chat.id)
+    target = access.resolve_target(update.effective_chat.id)
     if target is None:
-        await update.message.reply_text("Пока нет подключённой участницы.")
+        await update.message.reply_text("Нет доступа к записям.")
         return
-    await update.message.reply_text(report_text(target))
+    await update.message.reply_text(report_text(target.owner_chat_id))
 
 
-def report_target(requester_chat_id: int) -> int | None:
-    if not ADMIN_CHAT_ID or requester_chat_id != ADMIN_CHAT_ID:
-        return requester_chat_id
-    with db() as conn:
-        row = conn.execute(
-            """SELECT chat_id FROM participants
-               WHERE chat_id != ? ORDER BY consented_at DESC LIMIT 1""",
-            (ADMIN_CHAT_ID,),
-        ).fetchone()
-    return int(row["chat_id"]) if row else None
-
-
-def create_xlsx(chat_id: int, output: Path) -> None:
+def create_xlsx(chat_id: int, output: Path, show_private: bool = True) -> None:
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM checkins WHERE chat_id = ? ORDER BY completed_at", (chat_id,)
@@ -442,10 +421,13 @@ def create_xlsx(chat_id: int, output: Path) -> None:
     ws.append(headers)
     for row in rows:
         dt = datetime.fromisoformat(row["completed_at"])
+        hidden = "скрыто"
         ws.append([
             dt.strftime("%d.%m.%Y %H:%M"), row["period"], row["mood"], row["energy"],
-            row["anxiety"], row["sleep_hours"], row["meds"], row["side_effects"],
-            row["note"], row["safety"],
+            row["anxiety"], row["sleep_hours"], row["meds"],
+            row["side_effects"] if show_private else hidden,
+            row["note"] if show_private else hidden,
+            row["safety"] if show_private else hidden,
         ])
     fill = PatternFill("solid", fgColor="D9EAD3")
     for cell in ws[1]:
@@ -457,18 +439,41 @@ def create_xlsx(chat_id: int, output: Path) -> None:
         ws.column_dimensions[chr(64 + index)].width = width
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
+    # Лист «По дням»: пропуски записаны словами, а не нулями.
+    by_day = wb.create_sheet("По дням")
+    by_day.append(["Дата", "Отметок", "Ожидалось", "Пропущено", "Настроение мин–макс",
+                   "Энергия мин–макс", "Тревога мин–макс", "Сон, ч", "Контекст"])
+    if rows:
+        first = datetime.fromisoformat(rows[0]["started_at"]).astimezone(TZ).date()
+        today = datetime.now(TZ).date()
+        for d in stats.load_days(chat_id, first, today):
+            by_day.append([
+                d.day.strftime("%d.%m.%Y"), d.count("filled"), d.expected, d.count("missed"),
+                stats.fmt_range(d.values("mood")) if d.checkins else "нет отметок",
+                stats.fmt_range(d.values("energy")) if d.checkins else "нет отметок",
+                stats.fmt_range(d.values("anxiety")) if d.checkins else "нет отметок",
+                d.sleep if d.sleep is not None else "нет данных",
+                ", ".join(config.CONTEXT_TAGS.get(t, t) for t in d.context),
+            ])
+    for cell in by_day[1]:
+        cell.font = Font(bold=True)
+        cell.fill = fill
+    for index, width in enumerate([12, 9, 10, 10, 18, 16, 16, 12, 30], 1):
+        by_day.column_dimensions[chr(64 + index)].width = width
+    by_day.freeze_panes = "A2"
     wb.save(output)
 
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_chat and update.message
-    target = report_target(update.effective_chat.id)
+    target = access.resolve_target(update.effective_chat.id)
     if target is None:
-        await update.message.reply_text("Пока нет подключённой участницы.")
+        await update.message.reply_text("Нет доступа к записям.")
         return
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "mood_report.xlsx"
-        create_xlsx(target, path)
+        create_xlsx(target.owner_chat_id, path, target.show_private)
         with path.open("rb") as file:
             await update.message.reply_document(file, filename="mood_report.xlsx")
 
@@ -482,6 +487,7 @@ async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_chat and update.message
     with db() as conn:
         conn.execute("UPDATE participants SET active = 0 WHERE chat_id = ?", (update.effective_chat.id,))
+        storage.log_event(conn, update.effective_chat.id, "pause", datetime.now(TZ).isoformat())
     await update.message.reply_text("Напоминания приостановлены. Вернуть их: /resume")
 
 
@@ -489,6 +495,7 @@ async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_chat and update.message
     with db() as conn:
         conn.execute("UPDATE participants SET active = 1 WHERE chat_id = ?", (update.effective_chat.id,))
+        storage.log_event(conn, update.effective_chat.id, "resume", datetime.now(TZ).isoformat())
     await update.message.reply_text("Напоминания снова включены.")
 
 
@@ -514,6 +521,9 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     with db() as conn:
         conn.execute("DELETE FROM checkins WHERE chat_id = ?", (update.effective_chat.id,))
         conn.execute("DELETE FROM participants WHERE chat_id = ?", (update.effective_chat.id,))
+        conn.execute("DELETE FROM day_entries WHERE chat_id = ?", (update.effective_chat.id,))
+        conn.execute("DELETE FROM sharing WHERE owner_chat_id = ?", (update.effective_chat.id,))
+        conn.execute("DELETE FROM events WHERE chat_id = ?", (update.effective_chat.id,))
     await query.edit_message_text("Все данные удалены, напоминания отключены.")
 
 
@@ -536,36 +546,39 @@ def schedule_jobs(application: Application) -> None:
 
 def build_application(token: str) -> Application:
     application = Application.builder().token(token).build()
+    w = timed
+    text = filters.TEXT & ~filters.COMMAND
     conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("checkin", begin_checkin),
-            CallbackQueryHandler(begin_button, pattern=r"^begin:"),
+            CommandHandler("start", w(start)),
+            CommandHandler("checkin", w(begin_checkin)),
+            CallbackQueryHandler(w(begin_button), pattern=r"^begin:"),
         ],
         states={
-            CONSENT: [CallbackQueryHandler(consent, pattern=r"^consent:")],
-            MOOD: [CallbackQueryHandler(numeric_answer, pattern=r"^mood:")],
-            ENERGY: [CallbackQueryHandler(numeric_answer, pattern=r"^energy:")],
-            ANXIETY: [CallbackQueryHandler(numeric_answer, pattern=r"^anxiety:")],
-            SLEEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sleep_answer), CommandHandler("skip", skip_sleep)],
-            MEDS: [CallbackQueryHandler(meds_answer, pattern=r"^meds:")],
+            CONSENT: [CallbackQueryHandler(w(consent), pattern=r"^consent:")],
+            MOOD: [CallbackQueryHandler(w(numeric_answer), pattern=r"^mood:")],
+            ENERGY: [CallbackQueryHandler(w(numeric_answer), pattern=r"^energy:")],
+            ANXIETY: [CallbackQueryHandler(w(numeric_answer), pattern=r"^anxiety:")],
+            SLEEP: [MessageHandler(text, w(sleep_answer)), CommandHandler("skip", w(skip_sleep))],
+            MEDS: [CallbackQueryHandler(w(meds_answer), pattern=r"^meds:")],
             SIDE_EFFECTS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, side_effects_answer),
-                CommandHandler("skip", skip_side_effects),
+                MessageHandler(text, w(side_effects_answer)),
+                CommandHandler("skip", w(skip_side_effects)),
             ],
-            NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_answer), CommandHandler("skip", skip_note)],
-            SAFETY: [CallbackQueryHandler(safety_answer, pattern=r"^safety:")],
+            NOTE: [MessageHandler(text, w(note_answer)), CommandHandler("skip", w(skip_note))],
+            SAFETY: [CallbackQueryHandler(w(safety_answer), pattern=r"^safety:")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", w(cancel))],
     )
     application.add_handler(conversation)
-    application.add_handler(CommandHandler("report", report))
-    application.add_handler(CommandHandler("export", export))
-    application.add_handler(CommandHandler("pause", pause))
-    application.add_handler(CommandHandler("resume", resume))
-    application.add_handler(CommandHandler("delete_my_data", delete_my_data))
-    application.add_handler(CommandHandler("id", my_id))
-    application.add_handler(CallbackQueryHandler(delete_confirm, pattern=r"^delete:"))
+    application.add_handler(CommandHandler("report", w(report)))
+    application.add_handler(CommandHandler("export", w(export)))
+    application.add_handler(CommandHandler("pause", w(pause)))
+    application.add_handler(CommandHandler("resume", w(resume)))
+    application.add_handler(CommandHandler("delete_my_data", w(delete_my_data)))
+    application.add_handler(CommandHandler("id", w(my_id)))
+    application.add_handler(CallbackQueryHandler(w(delete_confirm), pattern=r"^delete:"))
+    dashboard.register(application, w)
     return application
 
 
@@ -573,6 +586,14 @@ def main() -> None:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и укажите новый токен.")
+    redact = RedactSecrets(token)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redact)
+    if os.getenv("ADMIN_CHAT_ID", "0").strip() not in ("", "0"):
+        LOG.warning(
+            "ADMIN_CHAT_ID больше не даёт доступа к записям. Доступ включает сама участница: "
+            "Пульт → Доступ для другого человека."
+        )
     init_db()
     application = build_application(token)
     schedule_jobs(application)
